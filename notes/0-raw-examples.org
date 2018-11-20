@@ -87,3 +87,38 @@ void loop_once(int efd, int lfd, int waitms) {
 #+END_SRC
 
 [[file:../raw-examples/epoll.cc][epoll.cc]]
+
+* 学习心得
+** 1. epoll
+一种 I/O 多路复用的实现机制
+
+1. =epoll_create(N)= 创建包含 N 个节点的 epoll 红黑树，返回 epoll 描述符 =efd=;
+2. =socket= 获得一个监听描述符 =lfd=, =bind= 到指定的地址和端口, =listen= 进行监听;
+3. 提取 =fld= 的模式并将 =NOBLOCK= 加入到模式中设置非阻塞；
+4. 定义事件 =epoll_event=, 并赋值 =lfd= 以及要监听的事件, 使用 =epoll_ctl= 将该事件安插到 =efd= 上；
+5. =epoll_wait= 对安插到 =efd= 上的事件进行监听，并返回满足条件的事件；
+6. 调用相关事件处理函数；
+** 2. epoll与 select、poll比较
+1. 事件驱动
+2. 底层使用红黑树
+3. 只返回满足条件的事件，无须遍历全部监听事件
+** 3. #define的使用：使用宏定义简化代码以及定位bug位置
+#+BEGIN_SRC cpp
+#define exit_if(r, ...)                                                                          \
+    if (r) {                                                                                     \
+        printf(__VA_ARGS__);                                                                     \
+        printf("%s:%d error no: %d error msg %s\n", __FILE__, __LINE__, errno, strerror(errno)); \
+        exit(1);                                                                                 \
+    }
+#+END_SRC
+** 4. C/C++编译器内置宏
+1. *#* ：表示编译预处理。如： =#ifdef= 、 =#endif= 等
+2. *##* ：在宏定义中拼接字符串，构成新的标识符。如 =#define SETTEST(N) test_ ##N= 使用时： =int SETTEST(1)=2 <=> int test_1=2=
+3. *\* : 在宏定义时将不同行连接成一行。如上 =exit_if=
+4. *__FILE__* : 文件路径及文件名
+5. *__LINE__* : 所在源代码中的行号
+6. *__VA_ARGS__* : 可变参数宏
+7. *__DATE__* : 编译日期
+8. *__TIME__* : 编译时刻
+9. *__STDC__* : 要求严格遵循 ANSI C 标准时为 1
+10. *__cplusplus* : 编写 c++ 时被定义
