@@ -1,0 +1,89 @@
+
+* epoll编程基础
+
+** 1. main函数
+#+BEGIN_SRC C++
+  ::signal(SIGPIPE, SIG_IGN); /* 客户端主动close后，服务端可以继续write,
+  第一次write返回RST, 第二次会返回 SIGPIPE 信号，默认是终止该服务进程，所以
+  要将该信号忽略，防止服务进程退出 */
+  httpRes = "HTTP/1.1 200 OK\r\nConnection: Keep-Alive\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 1048576\r\n\r\n123456";
+  /* 要发送给客户端的信息 */
+  for (int i = 0; i < 1048570; i++) {
+      httpRes += '\0';  // 不知道干啥的
+  }
+  short port = 80;
+  int epollfd = epoll_create(1);  // 创建一个节点的 epoll
+  exit_if(epollfd < 0, "epoll_create failed");
+  int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+  exit_if(listenfd < 0, "socket failed");
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof addr);
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = INADDR_ANY;
+  int r = ::bind(listenfd, (struct sockaddr *) &addr, sizeof(struct sockaddr));
+  exit_if(r, "bind to 0.0.0.0:%d failed %d %s", port, errno, strerror(errno));
+  r = listen(listenfd, 20); // 监听
+  exit_if(r, "listen failed %d %s", errno, strerror(errno));
+  printf("fd %d listening at %d\n", listenfd, port);
+  setNonBlock(listenfd); // 设置非阻塞
+  updateEvents(epollfd, listenfd, EPOLLIN, EPOLL_CTL_ADD);
+  for (;;) {  //实际应用应当注册信号处理函数，退出时清理资源
+      loop_once(epollfd, listenfd, 10000);
+  }
+#+END_SRC
+
+** 2. 设置非阻塞
+#+BEGIN_SRC cpp
+void setNonBlock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);              // 提取flags
+    exit_if(flags < 0, "fcntl failed");
+    int r = fcntl(fd, F_SETFL, flags | O_NONBLOCK); // 添加非阻塞flag
+    exit_if(r < 0, "fcntl failed");
+}
+#+END_SRC
+
+** 3. updateEvents
+   将句柄和对应的事件的 *epoll_event* 节点插入到epoll上
+#+BEGIN_SRC cpp
+void updateEvents(int efd, int fd, int events, int op) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = events;
+    ev.data.fd = fd;
+    printf("%s fd %d events read %d write %d\n", op == EPOLL_CTL_MOD ? "mod" : "add", fd, ev.events & EPOLLIN, ev.events & EPOLLOUT);
+    int r = epoll_ctl(efd, op, fd, &ev);
+    exit_if(r, "epoll_ctl failed");
+}
+#+END_SRC
+
+** 4. loop_once
+检查满足条件的事件的个数，并调用相应条件的处理函数
+#+BEGIN_SRC cpp
+void loop_once(int efd, int lfd, int waitms) {
+    const int kMaxEvents = 20;
+    struct epoll_event activeEvs[100];
+    int n = epoll_wait(efd, activeEvs, kMaxEvents, waitms);
+    if (output_log)
+        printf("epoll_wait return %d\n", n);
+    for (int i = 0; i < n; i++) {
+        int fd = activeEvs[i].data.fd;
+        int events = activeEvs[i].events;
+        if (events & (EPOLLIN | EPOLLERR)) {
+            if (fd == lfd) {
+                handleAccept(efd, fd);   // 处理请求事件
+            } else {
+                handleRead(efd, fd);      // 处理读事件
+            }
+        } else if (events & EPOLLOUT) {
+            if (output_log)
+                printf("handling epollout\n");
+            handleWrite(efd, fd);          // 处理写入事件
+        } else {
+            exit_if(1, "unknown event");
+        }
+    }
+}
+#+END_SRC
+
+[[file:../raw-examples/epoll.cc][epoll.cc]]
