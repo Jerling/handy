@@ -1,0 +1,32 @@
+* daemon 例子解析
+
+** 1. 从main函数开始
+#+BEGIN_SRC cpp
+Daemon::daemonProcess(); // 创建守护进程
+Conf conf;               // 配置守护进程
+Logger::*;               // 日志
+
+EventBase base;          // base 事件
+TcpServerPtr echo = TcpServer::startServer(&base, "", 2099);
+                         // 创建 echo TCP服务器，并绑定 2099 端口
+echo->onConnRead();      // 设置读回调函数
+base.runAfter();         // 1s 写一次日志
+base.loop();             // 事件循环
+
+#+END_SRC
+
+** 2. 程序输出
+#+BEGIN_SRC bash
+$ telnet 127.0.0.1 2099
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+hello daemon
+hello daemon
+#+END_SRC
+
+** 3. 学习新得
+- string 转换为字符串的相关成员函数
+  1. data(): C++11之前返回为不带 null 的字符串，之后带 null。
+  2. c_str(): 一直返回带 null 的字符串。
+  3. copy(chat *arr, size_t n): 返回最多复制 n 字节的字符串。
