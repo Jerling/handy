@@ -1,0 +1,64 @@
+* chat 实例解析
+** 1. 从main函数开始
+#+BEGIN_SRC cpp
+setloglevel()                    // 设置日志等级
+map<intptr_t, TcpConnPtr> users; // 一个用户对应一个连接
+TcpServerPtr chat = TcpServer::startServer() // 开启服务器
+chat->onConnCreate([&]{                      // 设置回调函数
+                       con->onState([&](&con){});      // tcp状态回调
+                       con->onMsg(_, [&](con, msg){}); // 消息回调
+                       return con;
+                   });
+loop();  // 循环监听
+return 0;
+#+END_SRC
+
+源代码：[[file:../examples/chat.cc][chat.cc]]
+** 2. 程序运行效果
+#+BEGIN_SRC bash
+# 服务端
+$ ./chat
+2018/11/21-16:41:32.500179 3cdc INFO handy/poller.cc:40 poller epoll 3 created
+2018/11/21-16:41:32.500245 3cdc TRACE handy/event_base.cc:151 wakeup pipe created 4 5
+2018/11/21-16:41:32.500259 3cdc TRACE handy/poller.cc:57 adding channel 1 fd 4 events 1 epoll 3
+2018/11/21-16:41:32.500310 3cdc INFO handy/conn.cc:285 fd 6 listening at 0.0.0.0:2099
+2018/11/21-16:41:32.500320 3cdc TRACE handy/poller.cc:57 adding channel 2 fd 6 events 1 epoll 3
+
+# 客户端1
+$ telnet 127.0.0.1 2099
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+<id> <msg>: send msg to <id>
+<msg>: send msg to all
+
+hello 1
+
+# 客户端2
+$ telnet 127.0.0.1 2099
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+<id> <msg>: send msg to <id>
+<msg>: send msg to all
+
+hello 2
+
+# 1发送消息给2
+2 hello, i am 1
+#sended to 1 users
+
+# 2接受消息
+1# hello, i am 1
+
+# 客户3群发消息
+hello 3
+0 i am 3
+#sended to 2 users
+#+END_SRC
+
+
+** 2. 学习心得
+1. TcpServerPtr 被定义为 =share_ptr= 智能指针，免去手动释放指针的工作
+2. 回调函数的设置都是通过C++11的新特性 lambda 匿名函数实现
+3. lambda 匿名函数的参数列表 =()= 是可选的
