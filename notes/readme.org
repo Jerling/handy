@@ -6,3 +6,5 @@
 
 ** 1. examples实例解析
 [[file:chat.org][1. chat例子解析]]
+
+[[file:daemon.org][2. daemon例子解析]]
