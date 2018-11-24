@@ -1,7 +1,7 @@
 * EventBase 源码剖析
 
 ** 1. EventBase的特性
-作为事件管理中心，它不能被复制，只能拥有一个实例。
+作为事件管理中心，它不能被复制。
 #+begin_src cpp
 // 定义仅有不能复制特性的基类
 struct noncopyable {
