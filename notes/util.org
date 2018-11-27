@@ -1,0 +1,112 @@
+* util 源码分析
+util 是 handy 网络库用到的一些基础工具集合，为了之后顺利看各主要组件的源码，所以打算先阅读
+该部分源码，比如分析 [[file:event_base.org][EventBase]] 时弄不清 RunAt 和 RunAfter 实现的区别。
+
+** 1. 接口
+先看看 handy 的 util 提供了的接口
+#+BEGIN_SRC cpp
+// uitl.h
+struct util {
+    static std::string format(const char *fmt, ...);
+    static int64_t timeMicro();
+    static int64_t timeMilli() { return timeMicro() / 1000; }
+    static int64_t steadyMicro();
+    static int64_t steadyMilli() { return steadyMicro() / 1000; }
+    static std::string readableTime(time_t t);
+    static int64_t atoi(const char *b, const char *e) { return strtol(b, (char **) &e, 10); }
+    static int64_t atoi2(const char *b, const char *e) {
+        char **ne = (char **) &e;
+        int64_t v = strtol(b, ne, 10);
+        return ne == (char **) &e ? v : -1;
+    }
+    static int64_t atoi(const char *b) { return atoi(b, b + strlen(b)); }
+    static int addFdFlag(int fd, int flag);
+};
+#+END_SRC
+
+从源码中可以看到，提供的接口有：
+1. =format= :格式化字符串
+2. =timeMilli= : 获取当前系统时间点精确到豪秒
+3. =timeMicro= : 获取当前系统时间点精确到微秒
+4. =steadytimeMilli= : 获取稳定系统时间点精确到豪秒
+5. =steadytimeMicro= : 获取稳定系统时间点精确到微秒
+6. =readableTime= : 返回格式化的时间(年-月-日-时-分秒)
+7. =aoti= : 重载了 =atoi=  函数，实现对 =strtol= 的封装，将 =b= 地址到 =e= 地址之间的 =10= 个字符转为 =long= 型
+整数
+8. =atoi2= : 同上，多了错误返回 -1；
+9. =addFdFlag= : 封装了 =fcntl= 函数，增加描述符的 =flag= ;
+
+** 2. 源码实现
+
+*** 2.1. format
+    格式化处理分两个阶段：先判断用 500 字节的 =buffer= 接受参数，如果不够再扩展到 30000 字节，
+还是不行就截断字符串到30000字节。其实也是对 =vsnprintf= 函数的封装。
+#+BEGIN_SRC cpp
+string util::format(const char *fmt, ...) {
+    char buffer[500];
+    unique_ptr<char[]> release1;
+    char *base;
+    for (int iter = 0; iter < 2; iter++) {
+        int bufsize;
+        if (iter == 0) {
+            bufsize = sizeof(buffer);
+            base = buffer;
+        } else {
+            bufsize = 30000;
+            base = new char[bufsize];
+            release1.reset(base);
+        }
+        char *p = base;
+        char *limit = base + bufsize;
+        if (p < limit) {
+            va_list ap;        // 参数列表, C中的定义处理参数的结构体
+            va_start(ap, fmt); // 按照fmt格式初始化参数列表
+            p += vsnprintf(p, limit - p, fmt, ap);
+            va_end(ap);
+        }
+        // Truncate to available space if necessary
+        if (p >= limit) {
+            if (iter == 0) {
+                continue;  // Try again with larger buffer
+            } else {
+                p = limit - 1;
+                *p = '\0';
+            }
+        }
+        break;
+    }
+    return base;
+}
+#+END_SRC
+
+*** 2.2. 时钟相关API
+    使用C++的 =chrono= 库的时钟管理， =time_point= 表示时间点， =duration_cast= 表示时延。
+具体的细节参考学习笔记：https://github.com/Jerling/Linux_programing/blob/master/CPP/4.%E5%90%8C%E6%AD%A5%E5%B9%B6%E5%8F%91%E6%93%8D%E4%BD%9C.org
+#+BEGIN_SRC cpp
+int64_t util::timeMicro() {
+    chrono::time_point<chrono::system_clock> p = chrono::system_clock::now();
+    return chrono::duration_cast<chrono::microseconds>(p.time_since_epoch()).count();
+}
+int64_t util::steadyMicro() {
+    chrono::time_point<chrono::steady_clock> p = chrono::steady_clock::now();
+    return chrono::duration_cast<chrono::microseconds>(p.time_since_epoch()).count();
+}
+#+END_SRC
+
+*** 2.3. 类型转换
+    在定义的时候已经实现，查看接口部分。重载了 C 风格的 =atoi= 等函数，封装了 =strtol= 函数，
+方便进行类型转换。
+
+*** 2.4. addFdFlag
+    封装了 =fcntl= 函数，实现对描述符添加 flag。
+#+BEGIN_SRC cpp
+int util::addFdFlag(int fd, int flag) {
+    int ret = fcntl(fd, F_GETFD);
+    return fcntl(fd, F_SETFD, ret | flag);
+}
+#+END_SRC
+
+
+** 3. 总结
+这部分源码分析比较简单，主要是 =handy= 网络库必不可少的一些小工具，字符串、时钟管理，类型转换
+以及添加flags。
