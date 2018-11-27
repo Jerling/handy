@@ -1,0 +1,149 @@
+* I/O 复用的封装
+  =handy= 库是 =unix/linux= 平台的C++网络库，因此封装了 =linux= 平台实现的 =epoll= 和 =unix=
+平台的 =kqueue= 。
+
+** 1. 接口
+    =handy= 封装好的接口。
+#+BEGIN_SRC cpp
+// poll.h
+#define POLLIN		0x001		/* There is data to read.  */
+#define POLLPRI		0x002		/* There is urgent data to read.  */
+#define POLLOUT		0x004		/* Writing now will not block.  */
+
+// poller.h
+const int kMaxEvents = 2000;
+const int kReadEvent = POLLIN;
+const int kWriteEvent = POLLOUT;
+
+struct PollerBase : private noncopyable {
+    int64_t id_;
+    int lastActive_;
+    PollerBase() : lastActive_(-1) {
+        static std::atomic<int64_t> id(0);
+        id_ = ++id;
+    }
+    virtual void addChannel(Channel *ch) = 0;
+    virtual void removeChannel(Channel *ch) = 0;
+    virtual void updateChannel(Channel *ch) = 0;
+    virtual void loop_once(int waitMs) = 0;
+    virtual ~PollerBase(){};
+};
+
+PollerBase *createPoller();
+#+END_SRC
+源码提供的接口：
+1. =addChannel= : 添加连接
+2. =removeChannel= : 断开接连
+3. =updateChannel= : 更新连接
+4. =loop_once= : 循环监听
+** 2. 实现
+   对应的实现在 poll.cc 文件中
+#+BEGIN_SRC cpp
+#ifdef OS_LINUX
+#include <sys/epoll.h>
+#elif defined(OS_MACOSX)
+#include <sys/event.h>
+#else
+#error "platform unsupported"
+#endif
+#+END_SRC
+根据平台差异自动选择对应的I/O复用函数。这里分析 linux 下的 epoll
+*** 2.1. 构造函数和析构函数
+1. 构造函数
+
+    =epoll_create1= 和 =epoll_create= 的区别是参数不是 size, 而是 flag; 因为 =epoll_create=
+ 自从 linux2.6.8后size 就没什么用了，内核会自动分配空间，只要不小于 0 就行， =epoll_create1=
+自 linux2.6.27 加入。参考：https://www.cppfans.org/1418.html
+#+BEGIN_SRC cpp
+PollerEpoll::PollerEpoll() {
+    fd_ = epoll_create1(EPOLL_CLOEXEC);
+    fatalif(fd_ < 0, "epoll_create error %d %s", errno, strerror(errno));
+    info("poller epoll %d created", fd_);
+}
+#+END_SRC
+2. 析构函数
+#+BEGIN_SRC cpp
+PollerEpoll::~PollerEpoll() {
+    info("destroying poller %d", fd_);
+    while (liveChannels_.size()) {
+        (*liveChannels_.begin())->close();
+    }
+    ::close(fd_);
+    info("poller %d destroyed", fd_);
+}
+#+END_SRC
+*** 2.2. 成员函数
+1. =addChannel=
+
+根据参数 Channel 提供的信息添加一个连接。
+#+BEGIN_SRC cpp
+void PollerEpoll::addChannel(Channel *ch) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = ch->events();           // 监听事件(r、w、e)
+    ev.data.ptr = ch;                   // 携带数据
+    trace("adding channel %lld fd %d events %d epoll %d", (long long) ch->id(), ch->fd(), ev.events, fd_);
+    int r = epoll_ctl(fd_, EPOLL_CTL_ADD, ch->fd(), &ev);  // 将 ch 对应的 fd 添加到 epoll实例上
+    fatalif(r, "epoll_ctl add failed %d %s", errno, strerror(errno));
+    liveChannels_.insert(ch);
+}
+#+END_SRC
+
+2. =updateChannel=
+#+BEGIN_SRC cpp
+void PollerEpoll::updateChannel(Channel *ch) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = ch->events();
+    ev.data.ptr = ch;
+    trace("modifying channel %lld fd %d events read %d write %d epoll %d", (long long) ch->id(), ch->fd(), ev.events & POLLIN, ev.events & POLLOUT, fd_);
+    int r = epoll_ctl(fd_, EPOLL_CTL_MOD, ch->fd(), &ev);
+    fatalif(r, "epoll_ctl mod failed %d %s", errno, strerror(errno));
+}
+#+END_SRC
+
+3. =removeChannel=
+#+BEGIN_SRC cpp
+void PollerEpoll::removeChannel(Channel *ch) {
+    trace("deleting channel %lld fd %d epoll %d", (long long) ch->id(), ch->fd(), fd_);
+    liveChannels_.erase(ch);
+    for (int i = lastActive_; i >= 0; i--) {
+        if (ch == activeEvs_[i].data.ptr) {  // 查看 ch 连接是否为激活转态
+            activeEvs_[i].data.ptr = NULL;   // 回收缓冲区
+            break;
+        }
+    }
+}
+#+END_SRC
+
+4. =loop_once=
+
+封装了 =epoll_wait=, 处理激活态连接的事件, 事件满足会调用注册在 =Channel= 上的回调函数。
+#+BEGIN_SRC cpp
+void PollerEpoll::loop_once(int waitMs) {
+    int64_t ticks = util::timeMilli();
+    lastActive_ = epoll_wait(fd_, activeEvs_, kMaxEvents, waitMs);
+    int64_t used = util::timeMilli() - ticks;  // 计算阻塞时间
+    trace("epoll wait %d return %d errno %d used %lld millsecond", waitMs, lastActive_, errno, (long long) used);
+    fatalif(lastActive_ == -1 && errno != EINTR, "epoll return error %d %s", errno, strerror(errno));
+    while (--lastActive_ >= 0) {
+        int i = lastActive_;
+        Channel *ch = (Channel *) activeEvs_[i].data.ptr;
+        int events = activeEvs_[i].events;
+        if (ch) {
+            if (events & (kReadEvent | POLLERR)) {
+                trace("channel %lld fd %d handle read", (long long) ch->id(), ch->fd());
+                ch->handleRead();
+            } else if (events & kWriteEvent) {
+                trace("channel %lld fd %d handle write", (long long) ch->id(), ch->fd());
+                ch->handleWrite();
+            } else {
+                fatal("unexpected poller events");
+            }
+        }
+    }
+}
+#+END_SRC
+** 4. 总结
+   =PollerEpoll= 封装 =epoll= 函数， =PollerKqueue= 封装了 =kqueue= , 它们都继承了 =PollerBase=,
+因此只要传递一个指向子类的指针给 =PollerBase= , 就可以实现多态，从而实现跨平台。
