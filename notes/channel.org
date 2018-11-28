@@ -1,0 +1,113 @@
+* Channel 源码剖析
+在 [[file:event_base.org][EventBase]] 源码剖析中，提到过 =Channel= 是一个连接的封装，这一部分剖析具体实现
+** 1. 接口
+#+BEGIN_SRC cpp
+//通道，封装了可以进行epoll的一个fd
+struct Channel : private noncopyable {
+    // base为事件管理器，fd为通道内部的fd，events为通道关心的事件
+    Channel(EventBase *base, int fd, int events);
+    ~Channel();
+    EventBase *getBase() { return base_; }
+    int fd() { return fd_; }
+    //通道id
+    int64_t id() { return id_; }
+    short events() { return events_; }
+    //关闭通道
+    void close();
+
+    //挂接事件处理器
+    void onRead(const Task &readcb) { readcb_ = readcb; }
+    void onWrite(const Task &writecb) { writecb_ = writecb; }
+    void onRead(Task &&readcb) { readcb_ = std::move(readcb); }
+    void onWrite(Task &&writecb) { writecb_ = std::move(writecb); }
+
+    //启用读写监听
+    void enableRead(bool enable);
+    void enableWrite(bool enable);
+    void enableReadWrite(bool readable, bool writable);
+    bool readEnabled();
+    bool writeEnabled();
+
+    //处理读写事件
+    void handleRead() { readcb_(); }
+    void handleWrite() { writecb_(); }
+
+   protected:
+    EventBase *base_;
+    PollerBase *poller_;
+    int fd_;
+    short events_;
+    int64_t id_;
+    std::function<void()> readcb_, writecb_, errorcb_;
+};
+#+END_SRC
+
+源代码位于 event_base.h 头文件中，接口如上注释
+** 2. 实现
+   接下来对接口的实现进行剖析
+*** 2.1. 构造与析构
+#+BEGIN_SRC cpp
+Channel::Channel(EventBase *base, int fd, int events)
+    : base_(base), fd_(fd), events_(events) {
+    fatalif(net::setNonBlock(fd_) < 0, "channel set non block failed");
+    static atomic<int64_t> id(0);   // 静态成员，原子类型保证全局 id 唯一
+    id_ = ++id;
+    poller_ = base_->imp_->poller_;
+    poller_->addChannel(this);      // 将自己注册到 epoll 上
+}
+
+Channel::~Channel() {
+    close();
+}
+#+END_SRC
+*** 2.2. 挂接事件处理器
+    实现源码在接口中，将口调函数注册到 Channel 中， 不过作者似乎没有实现异常口调函数的挂载。
+*** 2.3. 启动事件监听
+#+BEGIN_SRC cpp
+void Channel::enableRead(bool enable) {
+    if (enable) {
+        events_ |= kReadEvent;
+    } else {
+        events_ &= ~kReadEvent;
+    }
+    poller_->updateChannel(this);
+}
+
+void Channel::enableWrite(bool enable) {
+    if (enable) {
+        events_ |= kWriteEvent;
+    } else {
+        events_ &= ~kWriteEvent;
+    }
+    poller_->updateChannel(this);
+}
+
+void Channel::enableReadWrite(bool readable, bool writable) {
+    if (readable) {
+        events_ |= kReadEvent;
+    } else {
+        events_ &= ~kReadEvent;
+    }
+    if (writable) {
+        events_ |= kWriteEvent;
+    } else {
+        events_ &= ~kWriteEvent;
+    }
+    poller_->updateChannel(this);
+}
+#+END_SRC
+*** 2.4. 检查事件状态
+#+BEGIN_SRC cpp
+bool Channel::readEnabled() {
+    return events_ & kReadEvent;
+}
+bool Channel::writeEnabled() {
+    return events_ & kWriteEvent;
+}
+#+END_SRC
+*** 2.5. 事件处理函数
+    检查完事件的状态，根据返回的状态执行相应的回调函数, 实现位于接口中。
+自动调用回调函数位于 [[file:poller.org][Poller]] 的 =loop_once= 中。
+** 3. 总结
+   代码清晰易懂， =Channel= 充当中间者将已连接的描述符 =fd= 和事件管理者 =EventBase= 挂接在一起。
+这样就可以将事件监听统一交给 =EventBase= ,  =Channel= 则负责对应的事件处理函数。
