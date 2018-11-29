@@ -1,0 +1,339 @@
+* 网络工具
+  这部分主要是对网络通信的一些封装，字节序转换，IP地址表示以及缓冲区等。
+
+** port 对象
+该部分提供字节序转换和DNS解析, 位于 [[file:../handy/port_posix.h][port_posix]]
+
+*** 端口转换
+这里考虑到跨平台，所以作者自己实现了字节序的转换
+#+BEGIN_SRC cpp
+// 实现
+namespace port {
+static const int kLittleEndian = LITTLE_ENDIAN;
+inline uint16_t htobe(uint16_t v) {
+   if (!kLittleEndian) {
+       return v;
+   }
+   unsigned char *pv = (unsigned char *) &v;
+   return uint16_t(pv[0]) << 8 | uint16_t(pv[1]);
+   // 将地位字节右移一个字节
+}
+...
+}
+#+END_SRC
+*** 获取主机IP
+封装 Linux 和 MacOS 的DNS解析过程, 实现跨平台：
+1. 统一接口
+#+BEGIN_SRC cpp
+struct in_addr getHostByName(const std::string &host);
+uint64_t gettid();
+#+END_SRC
+2. 实现
+#+BEGIN_SRC cpp
+#ifdef OS_LINUX
+// 返回 IP 地址
+struct in_addr getHostByName(const std::string &host) {
+   struct in_addr addr;
+   char buf[1024];
+   struct hostent hent;
+   struct hostent *he = NULL;
+   int herrno = 0;
+   memset(&hent, 0, sizeof hent);
+   int r = gethostbyname_r(host.c_str(), &hent, buf, sizeof buf, &he, &herrno);
+   if (r == 0 && he && he->h_addrtype == AF_INET) {
+       addr = *reinterpret_cast<struct in_addr *>(he->h_addr);
+   } else {
+       addr.s_addr = INADDR_NONE;
+   }
+   return addr;
+}
+uint64_t gettid() {
+   return syscall(SYS_gettid);  // 待
+}
+#elif defined(OS_MACOSX)
+struct in_addr getHostByName(const std::string &host) {
+    struct in_addr addr;
+    struct hostent *he = gethostbyname(host.c_str());
+    if (he && he->h_addrtype == AF_INET) {
+        addr = *reinterpret_cast<struct in_addr *>(he->h_addr);
+    } else {
+        addr.s_addr = INADDR_NONE;
+    }
+    return addr;
+}
+uint64_t gettid() {
+    pthread_t tid = pthread_self();
+    uint64_t uid = 0;
+    memcpy(&uid, &tid, std::min(sizeof(tid), sizeof(uid)));
+    return uid;
+}
+#endif
+
+// 用到的结构和解析函数
+#include <netdb.h>
+
+struct hostent {
+ char  *h_name;            /* official name of host */
+ char **h_aliases;         /* alias list */
+ int    h_addrtype;        /* host address type */
+ int    h_length;          /* length of address */
+ char **h_addr_list;       /* list of addresses */
+}
+#define h_addr h_addr_list[0]  /* for backward compatibility */
+
+gethostbyname_r() //表示可重入的从主机得到DNS信息
+#+END_SRC
+
+** net 对象
+   封装网络字节序与主机字节序的转换和设置 =socket= 选项, 位于 [[file:../handy/net.h][net]]
+*** 封装网络字节序与主机字节序的转换。
+#+BEGIN_SRC cpp
+// 接口
+template <class T>
+static T hton(T v) {
+    return port::htobe(v);
+}
+template <class T>
+static T ntoh(T v) {
+    return port::htobe(v);
+}
+// 实现见 前面 port 部分
+#+END_SRC
+
+*** 设置 socket 选项
+1. 接口
+#+BEGIN_SRC cpp
+static int setNonBlock(int fd, bool value = true);
+static int setReuseAddr(int fd, bool value = true);
+static int setReusePort(int fd, bool value = true);
+static int setNoDelay(int fd, bool value = true);
+
+#+END_SRC
+
+2. 实现以 setNonBlock 为例：封装 fcntl 函数
+#+BEGIN_SRC cpp
+int net::setNonBlock(int fd, bool value) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return errno;
+    }
+    if (value) {
+        return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+#+END_SRC
+
+** Ip4Addr 对象
+
+*** 接口
+#+BEGIN_SRC cpp
+struct Ip4Addr {
+    Ip4Addr(const std::string &host, short port);
+    Ip4Addr(short port = 0) : Ip4Addr("", port) {}
+    Ip4Addr(const struct sockaddr_in &addr) : addr_(addr){};
+    std::string toString() const;
+    std::string ip() const;
+    short port() const;
+    unsigned int ipInt() const;
+    // if you pass a hostname to constructor, then use this to check error
+    bool isIpValid() const;
+    struct sockaddr_in &getAddr() {
+        return addr_;
+    }
+    static std::string hostToIp(const std::string &host) {
+        Ip4Addr addr(host, 0);
+        return addr.ip();
+    }
+
+   private:
+    struct sockaddr_in addr_;
+};
+#+END_SRC
+
+*** 实现
+1. 构造函数
+#+BEGIN_SRC cpp
+Ip4Addr::Ip4Addr(const string &host, short port) {
+    memset(&addr_, 0, sizeof addr_);
+    addr_.sin_family = AF_INET;
+    addr_.sin_port = htons(port);
+    if (host.size()) {
+        addr_.sin_addr = port::getHostByName(host); // 实现见 port
+    } else {
+        addr_.sin_addr.s_addr = INADDR_ANY;
+    }
+    if (addr_.sin_addr.s_addr == INADDR_NONE) {
+        error("cannot resove %s to ip", host.c_str());
+    }
+}
+#+END_SRC
+
+2. 成员函数
+#+BEGIN_SRC cpp
+string Ip4Addr::toString() const {
+    uint32_t uip = addr_.sin_addr.s_addr;
+    return util::format("%d.%d.%d.%d:%d", (uip >> 0) & 0xff, (uip >> 8) & 0xff, (uip >> 16) & 0xff, (uip >> 24) & 0xff, ntohs(addr_.sin_port));
+}
+
+string Ip4Addr::ip() const {
+    uint32_t uip = addr_.sin_addr.s_addr;
+    return util::format("%d.%d.%d.%d", (uip >> 0) & 0xff, (uip >> 8) & 0xff, (uip >> 16) & 0xff, (uip >> 24) & 0xff);
+}
+
+short Ip4Addr::port() const {
+    return ntohs(addr_.sin_port);
+}
+
+unsigned int Ip4Addr::ipInt() const {
+    return ntohl(addr_.sin_addr.s_addr);
+}
+bool Ip4Addr::isIpValid() const {
+    return addr_.sin_addr.s_addr != INADDR_NONE;
+}
+#+END_SRC
+
+** Buffer 对象
+封装 =*char= 实现一个类似标准容器的数据结构, 默认维护一个 512 字节缓冲区
+*** 接口
+#+BEGIN_SRC cpp
+struct Buffer {
+    Buffer() : buf_(NULL), b_(0), e_(0), cap_(0), exp_(512) {}
+    ~Buffer() { delete[] buf_; }
+    void clear() {
+        delete[] buf_;
+        buf_ = NULL;
+        cap_ = 0;
+        b_ = e_ = 0;
+    }
+    size_t size() const { return e_ - b_; }
+    bool empty() const { return e_ == b_; }
+    char *data() const { return buf_ + b_; }
+    char *begin() const { return buf_ + b_; }
+    char *end() const { return buf_ + e_; }
+    char *makeRoom(size_t len);
+    void makeRoom() {
+        if (space() < exp_)
+            expand(0);
+    }
+    size_t space() const { return cap_ - e_; }
+    void addSize(size_t len) { e_ += len; }
+    char *allocRoom(size_t len) {
+        char *p = makeRoom(len);
+        addSize(len);
+        return p;
+    }
+    Buffer &append(const char *p, size_t len) {
+        memcpy(allocRoom(len), p, len);
+        return *this;
+    }
+    Buffer &append(Slice slice) { return append(slice.data(), slice.size()); }
+    Buffer &append(const char *p) { return append(p, strlen(p)); }
+    template <class T>
+    Buffer &appendValue(const T &v) {
+        append((const char *) &v, sizeof v);
+        return *this;
+    }
+    // 消费 len 个字节
+    Buffer &consume(size_t len) {
+        b_ += len;
+        if (size() == 0)
+            clear();
+        return *this;
+    }
+    Buffer &absorb(Buffer &buf);
+    void setSuggestSize(size_t sz) { exp_ = sz; }
+    Buffer(const Buffer &b) { copyFrom(b); }
+    Buffer &operator=(const Buffer &b) {
+        if (this == &b)
+            return *this;
+        delete[] buf_;
+        buf_ = NULL;
+        copyFrom(b);
+        return *this;
+    }
+    operator Slice() { return Slice(data(), size()); }
+
+   private:
+    char *buf_;
+    size_t b_, e_, cap_, exp_;
+    void moveHead() {
+        std::copy(begin(), end(), buf_);
+        e_ -= b_;
+        b_ = 0;
+    }
+    void expand(size_t len);
+    void copyFrom(const Buffer &b);
+};
+#+END_SRC
+*** 实现
+看一下里面没在标准容器出现过的函数
+#+BEGIN_SRC cpp
+void moveHead() {
+    // 将 begin 至 end 的缓冲区拷贝到 Buffer 首部
+    std::copy(begin(), end(), buf_);
+    e_ -= b_;
+    b_ = 0;
+}
+// 扩容
+char *Buffer::makeRoom(size_t len) {
+    if (e_ + len <= cap_) {
+    } else if (size() + len < cap_ / 2) {
+        moveHead();
+    } else {
+        expand(len);
+    }
+    return end();
+}
+
+// 重新分配内存
+void Buffer::expand(size_t len) {
+    size_t ncap = std::max(exp_, std::max(2 * cap_, size() + len));
+    char *p = new char[ncap];
+    std::copy(begin(), end(), p);
+    e_ -= b_;
+    b_ = 0;
+    delete[] buf_;
+    buf_ = p;
+    cap_ = ncap;
+}
+
+void Buffer::copyFrom(const Buffer &b) {
+    memcpy(this, &b, sizeof b); // 拷贝对象
+    if (b.buf_) {
+        buf_ = new char[cap_];
+        memcpy(data(), b.begin(), b.size());// 拷贝对象的数据
+    }
+}
+
+// 分配空间, 返回末指针
+char *allocRoom(size_t len) {
+    char *p = makeRoom(len);
+    addSize(len);
+    return p;
+}
+Buffer &append(const char *p, size_t len) {
+    memcpy(allocRoom(len), p, len);
+    return *this;
+}
+
+// 抽取buf 中的内容
+Buffer &Buffer::absorb(Buffer &buf) {
+    if (&buf != this) {
+        if (size() == 0) {       // 如果为空，直接交换内存,不等追加完直接清空
+            char b[sizeof buf];  // 这里交换原因是不必 clear 了, 可能是 delete[] 开销略大？
+            memcpy(b, this, sizeof b);
+            memcpy(this, &buf, sizeof b);
+            memcpy(&buf, b, sizeof b);
+            std::swap(exp_, buf.exp_);  // keep the origin exp_
+        } else {
+            append(buf.begin(), buf.size());
+            buf.clear();
+        }
+    }
+    return *this;
+}
+#+END_SRC
+** 总结
+这部分内容还是一些基础的工具，在分析 TcpConn 对象是，发现依赖于底层的函数(如字节序转换相关的)，
+port 、net、Buffer刚好封装了这些函数，使得操作具有 C++ 的风格。于是就先剖析这部分源码。
