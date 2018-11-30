@@ -1,0 +1,323 @@
+* TcpConn 源码剖析
+  分析handy网络库的TCP连接部分源码，之前的源码分析几乎都依赖与TCP连接。
+
+** 接口与实现
+因为给的接口太多，避免篇幅过长，写在一起。
+*** 数据成员
+#+BEGIN_SRC cpp
+EventBase *base_;
+Channel *channel_;
+Buffer input_, output_;
+Ip4Addr local_, peer_;
+State state_;
+TcpCallBack readcb_, writablecb_, statecb_;
+std::list<IdleId> idleIds_;
+TimerId timeoutId_;
+AutoContext ctx_, internalCtx_;
+std::string destHost_, localIp_;
+int destPort_, connectTimeout_, reconnectInterval_;
+int64_t connectedTime_;
+std::unique_ptr<CodecBase> codec_; // 编码解码
+#+END_SRC
+
+**** 状态
+   handy 预定义了五种状态：
+#+BEGIN_SRC cpp
+// Tcp连接的个状态
+enum State {
+   Invalid = 1,
+   Handshaking,
+   Connected,
+   Closed,
+   Failed,
+};
+#+END_SRC
+
+**** 回调函数形式
+#+BEGIN_SRC cpp
+typedef std::function<void(const TcpConnPtr &)> TcpCallBack;
+#+END_SRC
+
+**** IdleId对象
+#+BEGIN_SRC cpp
+// handy-imp.h
+typedef std::unique_ptr<IdleIdImp> IdleId;
+
+// event_base.cc
+struct IdleNode {
+   TcpConnPtr con_;
+   int64_t updated_;
+   TcpCallBack cb_;
+};
+struct IdleIdImp {
+   IdleIdImp() {}
+   typedef list<IdleNode>::iterator Iter;
+   IdleIdImp(list<IdleNode> *lst, Iter iter) : lst_(lst), iter_(iter) {}
+   list<IdleNode> *lst_;
+   Iter iter_;
+};
+#+END_SRC
+
+*** 成员函数
+
+**** 构造析构
+#+BEGIN_SRC cpp
+// Tcp构造函数，实际可用的连接应当通过createConnection创建
+TcpConn();  // 默认构造函数
+virtual ~TcpConn();
+//可传入连接类型，返回智能指针
+template <class C = TcpConn>
+static TcpConnPtr createConnection(EventBase *base, const std::string &host, short port, int timeout = 0, const std::string &localip = "") {
+    TcpConnPtr con(new C);  // 拷贝构造函数
+    con->connect(base, host, port, timeout, localip);
+    return con;
+}
+template <class C = TcpConn>
+static TcpConnPtr createConnection(EventBase *base, int fd, Ip4Addr local, Ip4Addr peer) {
+    TcpConnPtr con(new C);
+    con->attach(base, fd, local, peer);
+    return con;
+}
+#+END_SRC
+上述两个 =createConnection= 第一个是创建新的 =TcpConn= , 第二个是连接到指定地址 =TcpConn= 。
+
+**** 连接函数
+1. 启用连接
+#+BEGIN_SRC cpp
+void TcpConn::attach(EventBase *base, int fd, Ip4Addr local, Ip4Addr peer) {
+    fatalif((destPort_ <= 0 && state_ != State::Invalid) || (destPort_ >= 0 && state_ != State::Handshaking),
+            "you should use a new TcpConn to attach. state: %d", state_);
+    base_ = base;
+    state_ = State::Handshaking;
+    local_ = local;
+    peer_ = peer;
+    delete channel_;
+    channel_ = new Channel(base, fd, kWriteEvent | kReadEvent);
+    trace("tcp constructed %s - %s fd: %d", local_.toString().c_str(), peer_.toString().c_str(), fd);
+    TcpConnPtr con = shared_from_this();
+    con->channel_->onRead([=] { con->handleRead(con); });
+    con->channel_->onWrite([=] { con->handleWrite(con); });
+}
+#+END_SRC
+1. 将状态置于握手转态
+2. 重新设置 base、本地ip和端口、目的ip和端口
+3. 增加自己的应用计数
+4. 创建新的 =Channel= 通道并绑定 =TcpConn= 的回调函数
+
+2. 创建连接并连接到本地
+#+BEGIN_SRC cpp
+void TcpConn::connect(EventBase *base, const string &host, short port, int timeout, const string &localip) {
+    fatalif(state_ != State::Invalid && state_ != State::Closed && state_ != State::Failed, "current state is bad state to connect. state: %d", state_);
+    destHost_ = host;
+    destPort_ = port;
+    connectTimeout_ = timeout;
+    connectedTime_ = util::timeMilli();
+    localIp_ = localip;
+    Ip4Addr addr(host, port);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    fatalif(fd < 0, "socket failed %d %s", errno, strerror(errno));
+    net::setNonBlock(fd);
+    int t = util::addFdFlag(fd, FD_CLOEXEC);
+    fatalif(t, "addFdFlag FD_CLOEXEC failed %d %s", t, strerror(t));
+    int r = 0;
+    if (localip.size()) {
+        Ip4Addr addr(localip, 0);
+        r = ::bind(fd, (struct sockaddr *) &addr.getAddr(), sizeof(struct sockaddr));
+        error("bind to %s failed error %d %s", addr.toString().c_str(), errno, strerror(errno));
+    }
+    if (r == 0) {
+        r = ::connect(fd, (sockaddr *) &addr.getAddr(), sizeof(sockaddr_in));
+        if (r != 0 && errno != EINPROGRESS) {
+            error("connect to %s error %d %s", addr.toString().c_str(), errno, strerror(errno));
+        }
+    }
+
+    sockaddr_in local;
+    socklen_t alen = sizeof(local);
+    if (r == 0) {
+        r = getsockname(fd, (sockaddr *) &local, &alen);
+        if (r < 0) {
+            error("getsockname failed %d %s", errno, strerror(errno));
+        }
+    }
+    state_ = State::Handshaking;
+    attach(base, fd, Ip4Addr(local), addr);
+    if (timeout) {
+        TcpConnPtr con = shared_from_this();
+        timeoutId_ = base->runAfter(timeout, [con] {
+            if (con->getState() == Handshaking) {
+                con->channel_->close();
+            }
+        });
+    }
+}
+#+END_SRC
+这个函数封装了原生的 =scoket= 的 =socket= 、 =bind= 、 =connect= 等相关函数，步骤就不说了。
+不过值得注意的是为什么要先 =attach= 到本地呢？难道是让这个连接一直存在，只需指定连接的目的主机
+增加引用计数即可，而无需在重新创建 =TcpConn= 了, 从而提升性能。
+
+**** 关闭连接
+#+BEGIN_SRC cpp
+void TcpConn::close() {
+    if (channel_) {
+        TcpConnPtr con = shared_from_this();  // 获得所有权为了释放 Channel 但自己会是只能指针有系统回收
+        getBase()->safeCall([con] {
+            if (con->channel_)
+                con->channel_->close();
+        });
+    }
+}
+#+END_SRC
+清理函数 cleanup
+#+BEGIN_SRC cpp
+void TcpConn::cleanup(const TcpConnPtr &con) {
+    if (readcb_ && input_.size()) {
+        readcb_(con);
+    }
+    if (state_ == State::Handshaking) {
+        state_ = State::Failed;
+    } else {
+        state_ = State::Closed;
+    }
+    trace("tcp closing %s - %s fd %d %d", local_.toString().c_str(), peer_.toString().c_str(), channel_ ? channel_->fd() : -1, errno);
+    getBase()->cancel(timeoutId_);
+    if (statecb_) {
+        statecb_(con);
+    }
+    if (reconnectInterval_ >= 0 && !getBase()->exited()) {  // reconnect
+        reconnect(); // 这个函数找不到定义，不知为何？
+        return;
+    }
+    for (auto &idle : idleIds_) {
+        handyUnregisterIdle(getBase(), idle);
+    }
+    // channel may have hold TcpConnPtr, set channel_ to NULL before delete
+    readcb_ = writablecb_ = statecb_ = nullptr;
+    Channel *ch = channel_;
+    channel_ = NULL;
+    delete ch;
+}
+#+END_SRC
+
+
+**** 下面是一些处理通信方面的函数
+1. 通信之前确认握手完成
+#+BEGIN_SRC cpp
+int TcpConn::handleHandshake(const TcpConnPtr &con) {
+    fatalif(state_ != Handshaking, "handleHandshaking called when state_=%d", state_);
+    struct pollfd pfd;
+    pfd.fd = channel_->fd();
+    pfd.events = POLLOUT | POLLERR;
+    int r = poll(&pfd, 1, 0);
+    if (r == 1 && pfd.revents == POLLOUT) {
+        channel_->enableReadWrite(true, false);
+        state_ = State::Connected;
+        if (state_ == State::Connected) {
+            connectedTime_ = util::timeMilli();
+            trace("tcp connected %s - %s fd %d", local_.toString().c_str(), peer_.toString().c_str(), channel_->fd());
+            if (statecb_) {
+                statecb_(con);
+            }
+        }
+    } else {
+        trace("poll fd %d return %d revents %d", channel_->fd(), r, pfd.revents);
+        cleanup(con);
+        return -1;
+    }
+    return 0;
+}
+#+END_SRC
+
+2. 读写函数
+先处理对应的缓冲区的数据以及状态，看是否可读以及是否有数据，在调用对应的回调函数。
+#+BEGIN_SRC cpp
+void TcpConn::handleRead(const TcpConnPtr &con) {
+    if (state_ == State::Handshaking && handleHandshake(con)) {
+        return;
+    }
+    while (state_ == State::Connected) {
+        input_.makeRoom();
+        int rd = 0;
+        if (channel_->fd() >= 0) {
+            rd = readImp(channel_->fd(), input_.end(), input_.space());  // 从关联的 Channel 中读写数据到缓冲区
+            trace("channel %lld fd %d readed %d bytes", (long long) channel_->id(), channel_->fd(), rd);
+        }
+        if (rd == -1 && errno == EINTR) {
+            continue;
+        } else if (rd == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            for (auto &idle : idleIds_) {
+                handyUpdateIdle(getBase(), idle);  // 处理闲置， 不过好像也没做啥玩意
+            }
+            if (readcb_ && input_.size()) {
+                readcb_(con);   // 调用回调函数
+            }
+            break;
+        } else if (channel_->fd() == -1 || rd == 0 || rd == -1) {
+            cleanup(con);
+            break;
+        } else {  // rd > 0
+            input_.addSize(rd);
+        }
+    }
+}
+
+
+void TcpConn::handleWrite(const TcpConnPtr &con) {
+    if (state_ == State::Handshaking) {
+        handleHandshake(con);
+    } else if (state_ == State::Connected) {
+        ssize_t sended = isend(output_.begin(), output_.size());  //从缓冲区获取数据
+        output_.consume(sended);
+        if (output_.empty() && writablecb_) {
+            writablecb_(con);           // 调用写回调
+        }
+        if (output_.empty() && channel_->writeEnabled()) {  // writablecb_ may write something
+            channel_->enableWrite(false);
+        }
+    } else {
+        error("handle write unexpected");
+    }
+}
+#+END_SRC
+
+3. 消息函数
+
+#+BEGIN_SRC cpp
+void TcpConn::onMsg(CodecBase *codec, const MsgCallBack &cb) {
+    assert(!readcb_);   // 和读回调函数互斥
+    codec_.reset(codec); // 编码方式
+    onRead([cb](const TcpConnPtr &con) {   // 绑定消息回调
+        int r = 1;
+        while (r) {
+            Slice msg;
+            r = con->codec_->tryDecode(con->getInput(), msg); // 将消息存入缓冲区
+            if (r < 0) {
+                con->channel_->close();
+                break;
+            } else if (r > 0) {
+                trace("a msg decoded. origin len %d msg len %ld", r, msg.size());
+                cb(con, msg);
+                con->getInput().consume(r);
+            }
+        }
+    });
+}
+
+void TcpConn::sendMsg(Slice msg) {
+    codec_->encode(msg, getOutput());
+    sendOutput();   // 直接使用 send 函数发送也就是存入缓冲区等待写回调发送。
+}
+#+END_SRC
+
+** 总结
+这部分的内容比较多，管理里的东西也比较多，所以源码分析的比较粗糙，如果需要，后面继续补充完整。
+
+分析到这里，差不多主体的架构分析完整了， 只剩和用户直接打交道的 =TcpServer= 和消息处理的编码解码过程。
+=handy= 的工作原理(预测)：
+
+1. 创建一个监听的 =Base=
+2. 在 =Base= 创建 =TcpServer=, 在里面封装了 =TcpConn= 连接， =TcpConn= 里面封装了 =Channel= 通道。
+在这里面： =TcpServer= 于 =TcpConn= 是一对多的关系， =TcpConn= 和 =Channel= 是一对一的关系。 =Channel=
+是动作的回调动作的执行者， 不过发送消息是直接由 =TcpConn= 直接处理。
+4. 绑定对应的回调事件
+5. =Base= 进行循环监听
