@@ -1,0 +1,144 @@
+* TcpServer 源码剖析
+
+** 接口
+#+BEGIN_SRC cpp
+// Tcp服务器
+struct TcpServer : private noncopyable {
+    TcpServer(EventBases *bases);
+    // return 0 on sucess, errno on error
+    int bind(const std::string &host, short port, bool reusePort = false);
+    static TcpServerPtr startServer(EventBases *bases, const std::string &host, short port, bool reusePort = false);
+    ~TcpServer() { delete listen_channel_; }
+    Ip4Addr getAddr() { return addr_; }
+    EventBase *getBase() { return base_; }
+    void onConnCreate(const std::function<TcpConnPtr()> &cb) { createcb_ = cb; }
+    void onConnState(const TcpCallBack &cb) { statecb_ = cb; }
+    void onConnRead(const TcpCallBack &cb) {
+        readcb_ = cb;
+        assert(!msgcb_);
+    }
+    // 消息处理与Read回调冲突，只能调用一个
+    void onConnMsg(CodecBase *codec, const MsgCallBack &cb) {
+        codec_.reset(codec);
+        msgcb_ = cb;
+        assert(!readcb_);
+    }
+
+   private:
+    EventBase *base_;
+    EventBases *bases_;
+    Ip4Addr addr_;
+    Channel *listen_channel_;
+    TcpCallBack statecb_, readcb_;
+    MsgCallBack msgcb_;
+    std::function<TcpConnPtr()> createcb_;
+    std::unique_ptr<CodecBase> codec_;
+    void handleAccept();
+};
+#+END_SRC
+
+** 实现
+
+*** 构造函数
+#+BEGIN_SRC cpp
+TcpServer::TcpServer(EventBases *bases) :
+base_(bases->allocBase()), bases_(bases),
+listen_channel_(NULL), createcb_([] { return TcpConnPtr(new TcpConn); }) {}
+#+END_SRC
+在构造 =TcpServer= 的时候分配对应的时候同时创建了一个新的 =TcpConn= 连接。
+
+*** socket 地址绑定
+    对 =bind= 函数的封装。
+#+BEGIN_SRC cpp
+int TcpServer::bind(const std::string &host, short port, bool reusePort) {
+    addr_ = Ip4Addr(host, port);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int r = net::setReuseAddr(fd);
+    fatalif(r, "set socket reuse option failed");
+    r = net::setReusePort(fd, reusePort);
+    fatalif(r, "set socket reuse port option failed");
+    r = util::addFdFlag(fd, FD_CLOEXEC);
+    fatalif(r, "addFdFlag FD_CLOEXEC failed");
+    r = ::bind(fd, (struct sockaddr *) &addr_.getAddr(), sizeof(struct sockaddr));
+    if (r) {
+        close(fd);
+        error("bind to %s failed %d %s", addr_.toString().c_str(), errno, strerror(errno));
+        return errno;
+    }
+    r = listen(fd, 20);
+    fatalif(r, "listen failed %d %s", errno, strerror(errno));
+    info("fd %d listening at %s", fd, addr_.toString().c_str());
+    listen_channel_ = new Channel(base_, fd, kReadEvent);
+    listen_channel_->onRead([this] { handleAccept(); });
+    return 0;
+}
+#+END_SRC
+在 =bind= 函数中，主要是 =socket= 编程的 =bind= 的封装，并且设置的地址和端口重用以及设置 =Channel=
+的读回调，具体的设置了处理请求的回调。
+
+*** 开启服务
+#+BEGIN_SRC cpp
+TcpServerPtr TcpServer::startServer(EventBases *bases, const std::string &host, short port, bool reusePort) {
+    TcpServerPtr p(new TcpServer(bases));
+    int r = p->bind(host, port, reusePort);
+    if (r) {
+        error("bind to %s:%d failed %d %s", host.c_str(), port, errno, strerror(errno));
+    }
+    return r == 0 ? p : NULL;
+}
+#+END_SRC
+将 =TcpServer= 实例化和地址绑定放在一起，当然也可以先实例化一个 =TcpServer= ，然后手动绑定地址。
+*** 处理请求
+#+BEGIN_SRC cpp
+void TcpServer::handleAccept() {
+    struct sockaddr_in raddr;
+    socklen_t rsz = sizeof(raddr);
+    int lfd = listen_channel_->fd();
+    int cfd;
+    while (lfd >= 0 && (cfd = accept(lfd, (struct sockaddr *) &raddr, &rsz)) >= 0) {
+        sockaddr_in peer, local;
+        socklen_t alen = sizeof(peer);
+        int r = getpeername(cfd, (sockaddr *) &peer, &alen);
+        if (r < 0) {
+            error("get peer name failed %d %s", errno, strerror(errno));
+            continue;
+        }
+        r = getsockname(cfd, (sockaddr *) &local, &alen);
+        if (r < 0) {
+            error("getsockname failed %d %s", errno, strerror(errno));
+            continue;
+        }
+        r = util::addFdFlag(cfd, FD_CLOEXEC);
+        fatalif(r, "addFdFlag FD_CLOEXEC failed");
+        EventBase *b = bases_->allocBase();
+        auto addcon = [=] {
+            TcpConnPtr con = createcb_();
+            con->attach(b, cfd, local, peer);
+            if (statecb_) {
+                con->onState(statecb_);
+            }
+            if (readcb_) {
+                con->onRead(readcb_);
+            }
+            if (msgcb_) {
+                con->onMsg(codec_->clone(), msgcb_);
+            }
+        };
+        if (b == base_) {
+            addcon();
+        } else {
+            b->safeCall(move(addcon));
+        }
+    }
+    if (lfd >= 0 && errno != EAGAIN && errno != EINTR) {
+        warn("accept return %d  %d %s", cfd, errno, strerror(errno));
+    }
+}
+#+END_SRC
+
+*** 回调函数
+源码在接口中，之前剖析过很多回调函数相关的设置，这里不再赘述
+
+** 总结
+这部分内容比较少， =TcpServer= 相当于前台的管理，只是处理外来请求，将对应的连接添加到
+对应的 =EventBase= 上，然后继续监听，数据传输由后台的 =poller= 进行处理。
