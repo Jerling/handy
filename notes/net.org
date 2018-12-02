@@ -1,5 +1,5 @@
 * 网络工具
-  这部分主要是对网络通信的一些封装，字节序转换，IP地址表示以及缓冲区等。
+  这部分主要是对网络通信函数的一些封装，字节序转换，IP地址表示以及缓冲区等。
 
 ** port 对象
 该部分提供字节序转换和DNS解析, 位于 [[file:../handy/port_posix.h][port_posix]]
@@ -16,7 +16,7 @@ inline uint16_t htobe(uint16_t v) {
    }
    unsigned char *pv = (unsigned char *) &v;
    return uint16_t(pv[0]) << 8 | uint16_t(pv[1]);
-   // 将地位字节右移一个字节
+   // 将地位字节左移一个字节
 }
 ...
 }
