@@ -317,7 +317,7 @@ void TcpConn::sendMsg(Slice msg) {
 
 1. 创建一个监听的 =Base=
 2. 在 =Base= 创建 =TcpServer=, 在里面封装了 =TcpConn= 连接， =TcpConn= 里面封装了 =Channel= 通道。
-在这里面： =TcpServer= 于 =TcpConn= 是一对多的关系， =TcpConn= 和 =Channel= 是一对一的关系。 =Channel=
+在这里面： =TcpServer= 与 =TcpConn= 是一对多的关系， =TcpConn= 和 =Channel= 是一对一的关系。 =Channel=
 是动作的回调动作的执行者， 不过发送消息是直接由 =TcpConn= 直接处理。
 4. 绑定对应的回调事件
 5. =Base= 进行循环监听
